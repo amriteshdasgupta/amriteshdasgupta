@@ -61,20 +61,24 @@ def render(data, output):
     selected = recent_days(data)
     if not selected:
         raise ValueError("Contribution calendar is empty")
-    # Daily buildings keep the calendar structure; the foreground market
-    # and its inhabitants are decorative, rather than extra activity days.
-    width, height = 850, 580
+    # Twenty activity buildings share a town with decorative market stalls.
+    width, height = 960, 660
     image = Image.new("RGB", (width, height), "#0d1117")
     draw = ImageDraw.Draw(image)
     lights = []
     rng = random.Random(824)
+    transform = None
     greens = ["#212830", "#0e4429", "#006d32", "#26a641", "#39d353"]
     levels = {name: i for i, name in enumerate([
         "NONE", "FIRST_QUARTILE", "SECOND_QUARTILE", "THIRD_QUARTILE", "FOURTH_QUARTILE"
     ])}
 
     def point(u, v, z=0):
-        return (round(355 + u * 85 - v * 45), round(160 + u * 25 + v * 35 - z))
+        if transform is not None:
+            origin_u, origin_v, sx, sy = transform
+            u = origin_u + (u - origin_u) * sx + (1 - sx) * 0.44
+            v = origin_v + (v - origin_v) * sy + (1 - sy) * 0.44
+        return (round(310 + u * 78 - v * 50), round(200 + u * 22 + v * 40 - z))
 
     def lamp(x, y, size=2):
         draw.rectangle((x - size, y - size, x + size, y + size), fill="#ffc66d")
@@ -107,24 +111,30 @@ def render(data, output):
         draw.polygon([b, c, bottom_c, bottom_b], fill=shade(color, 0.43))
         draw.polygon([a, b, c, e], fill=color)
 
-    block(-0.25, -0.25, 5.5, 7.5, -12, 9, "#26352f")
-    # Cobblestone lanes extend in front of the contribution district.
-    for u in range(20):
-        for v in range(28):
+    block(-0.25, -0.25, 7.5, 5.8, -12, 9, "#26352f")
+    for u in range(28):
+        for v in range(22):
             block(u / 4, v / 4, 0.23, 0.23, -2, 2, rng.choice(["#303c38", "#293630", "#344039"]))
-    days = [(i % 5, i // 5, day) for i, day in enumerate(selected)]
-    peak = max([day["contributionCount"] for _, _, day in days] + [1])
-    # Draw back to front so near towers correctly obscure distant ones.
-    for u, v, day in sorted(days, key=lambda item: (item[0] + item[1], item[0])):
+    ground = image.convert("RGBA")
+    layout = ["BSBBSBB", "SB.BBSB", "B.SBSB.", "SBBSB.B", "BS.BSBB"]
+    plots = [(u, v, kind) for v, row in enumerate(layout) for u, kind in enumerate(row)]
+    peak = max([day["contributionCount"] for day in selected] + [1])
+
+    def building(u, v, day):
+        nonlocal transform
         count = day["contributionCount"]
         level = levels[day["contributionLevel"]]
         color = greens[level]
         block(u, v, 0.88, 0.88, 0, 2, greens[0])
         if not count:
-            continue
-        # An exaggerated baseline makes even quiet active days substantial.
-        # Counts still control relative height and GitHub controls the greens.
-        h = 52 + round(70 * math.sqrt(count / peak))
+            return
+        activity = count / peak
+        # Strong height and footprint variation, while keeping a little
+        # artistic exaggeration for the most active days' keeps.
+        sx = 0.48 + 0.5 * math.sqrt(activity)
+        sy = 0.52 + 0.44 * activity ** 0.65
+        transform = (u, v, sx, sy)
+        h = 23 + round(132 * activity ** 0.85)
         block(u + 0.07, v + 0.07, 0.74, 0.74, 2, h, color)
         # Thin masonry courses on both visible stone faces.
         for z in range(10, h, 12):
@@ -157,23 +167,50 @@ def render(data, output):
             x, y = point(u + 0.1, v + 0.1, h + 10)
             draw.line((x, y, x, y - 20), fill="#83c99a", width=1)
             draw.polygon([(x + 1, y - 20), (x + 12, y - 17), (x + 1, y - 12)], fill="#39d353")
-    # A lively promenade: canopies, barrels, shoppers, and hanging lanterns.
-    for u in range(5):
-        stall(u, 4.3, rng.choice(["#287846", "#a35943", "#b58b46", "#3e7779"]))
-        for du in [0.05, 0.8]:
-            x, y = point(u + du, 5.3, 0)
+        transform = None
+
+    def market(u, v):
+        stall(u + 0.04, v + 0.03, rng.choice(["#287846", "#a35943", "#b58b46", "#3e7779"]))
+        for du in [0.05, 0.85]:
+            x, y = point(u + du, v + 0.92, 0)
             draw.ellipse((x - 6, y - 10, x + 6, y + 2), fill="#805d3a", outline="#b19459")
             draw.line((x - 6, y - 3, x + 6, y - 3), fill="#382f27", width=2)
-    for u in range(5):
         end = u + 1
         for pos in [u, end]:
-            draw.line([point(pos, 5.3), point(pos, 5.3, 52)], fill="#977950", width=2)
-        cable = [point(u + (end - u) * t / 24, 5.3, 52 - 9 * math.sin(math.pi * t / 24)) for t in range(25)]
+            draw.line([point(pos, v + 0.9), point(pos, v + 0.9, 44)], fill="#977950", width=2)
+        cable = [point(u + (end - u) * t / 24, v + 0.9, 44 - 9 * math.sin(math.pi * t / 24)) for t in range(25)]
         draw.line(cable, fill="#8c8260", width=1)
         for t in range(2, 24, 4):
             x, y = cable[t]
             draw.line((x, y, x, y + 4), fill="#b09964")
             lamp(x, y + 6)
+
+    # Cache transparent sprites. Buildings, stalls, and moving inhabitants
+    # all share the same depth ordering, including people behind buildings.
+    scenery = []
+    day_iter = iter(selected)
+    for u, v, kind in plots:
+        layer = Image.new("RGBA", image.size)
+        draw = ImageDraw.Draw(layer)
+        if kind == "B":
+            day = next(day_iter, None)
+            if day is not None:
+                building(u, v, day)
+        elif kind == "S":
+            market(u, v)
+        else:
+            # Small leafy planters break up the paved courtyards.
+            block(u + 0.55, v + 0.1, 0.22, 0.22, 0, 7, "#755c40")
+            x, y = point(u + 0.66, v + 0.21, 12)
+            draw.ellipse((x - 8, y - 7, x + 8, y + 5), fill="#416b40")
+        box = layer.getbbox()
+        if box:
+            scenery.append((point(u + 0.44, v + 0.82)[1], layer.crop(box), box[:2]))
+    scenery.sort(key=lambda item: item[0])
+    image = ground.copy()
+    for _, sprite, position in scenery:
+        image.alpha_composite(sprite, position)
+    image = image.convert("RGB")
     # Soft amber bloom adds warmth without flattening the pixel geometry.
     glow = Image.new("RGB", image.size)
     glow_draw = ImageDraw.Draw(glow)
@@ -184,21 +221,23 @@ def render(data, output):
         r = size + 3
         glow_draw.ellipse((x - r, y - r, x + r, y + r), fill=(105, 60, 16))
     bloom = glow.filter(ImageFilter.GaussianBlur(4))
-    # Small looping routes and alternating footfalls give the square life.
-    shoppers = [(0.25 + rng.random() * 4.45, 5.65 + rng.random() * 0.95,
-                 rng.random() * math.tau, rng.choice(["#759c8c", "#a46c65", "#bc9d60", "#707fa1"]))
-                for _ in range(24)]
+    # Walking routes thread between plots and through the pocket squares.
+    routes = [(u + 0.45, v + 1.02) for u, v, _ in plots if (u + v) % 2 == 0]
+    routes += [(u + 0.32, v + 0.5) for u, v, kind in plots if kind == "."]
+    shoppers = [(u, v, rng.random() * math.tau,
+                 rng.choice(["#759c8c", "#a46c65", "#bc9d60", "#707fa1"])) for u, v in routes]
     frames = []
     for frame_index in range(40):
         phase = math.tau * frame_index / 40
-        frame = ImageChops.add(image, bloom.point(lambda p: round(p * (0.94 + 0.06 * math.sin(phase)))))
-        painter = ImageDraw.Draw(frame)
+        frame = ground.copy()
         people = []
         for u, v, offset, coat in shoppers:
             t = phase + offset
-            x, y = point(u + 0.2 * math.sin(t), v + 0.1 * math.cos(t))
-            people.append((y, x, t, coat))
-        for y, x, t, coat in sorted(people):
+            x, y = point(u + 0.2 * math.sin(t), v + 0.035 * math.cos(t))
+            layer = Image.new("RGBA", (18, 25))
+            painter = ImageDraw.Draw(layer)
+            screen_x, screen_y = x, y
+            x, y = 9, 22
             stride = round(2 * math.sin(t * 6))
             painter.ellipse((x - 5, y - 2, x + 5, y + 2), fill="#17251f")
             painter.line((x - 2, y - 5, x - 2 + stride, y), fill="#c5b08b", width=2)
@@ -207,6 +246,10 @@ def render(data, output):
             painter.line((x - 4, y - 11, x - 5 + stride, y - 6), fill="#d7b48a", width=2)
             painter.rectangle((x - 2, y - 18, x + 2, y - 14), fill="#d7b48a")
             painter.rectangle((x - 3, y - 19, x + 2, y - 18), fill="#514236")
+            people.append((screen_y, layer, (screen_x - 9, screen_y - 22)))
+        for _, sprite, position in sorted(scenery + people, key=lambda item: item[0]):
+            frame.alpha_composite(sprite, position)
+        frame = ImageChops.add(frame.convert("RGB"), bloom.point(lambda p: round(p * (0.94 + 0.06 * math.sin(phase)))))
         frames.append(frame)
     # Shared palette prevents color shimmer between frames.
     palette = frames[0].quantize(colors=256)
