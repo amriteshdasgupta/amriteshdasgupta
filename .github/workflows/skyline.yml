@@ -1,0 +1,41 @@
+name: Update contribution skyline
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - scripts/skyline.py
+      - requirements.txt
+      - .github/workflows/skyline.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: contribution-skyline
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python scripts/skyline.py --username "$PROFILE_USERNAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROFILE_USERNAME: ${{ github.repository_owner }}
+      - name: Save updated skyline
+        run: |
+          if ! git diff --quiet -- assets/skyline.png; then
+            git add assets/skyline.png
+            git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Update contribution skyline'
+            git push
+          fi
