@@ -34,8 +34,8 @@ jobs:
           PROFILE_USERNAME: ${{ github.repository_owner }}
       - name: Save updated skyline
         run: |
-          if ! git diff --quiet -- assets/skyline.png; then
-            git add assets/skyline.png
+          if ! git diff --quiet -- assets/market.gif; then
+            git add assets/market.gif
             git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Update contribution skyline'
             git push
           fi

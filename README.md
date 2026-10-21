@@ -2,4 +2,4 @@
 
 [amritesh.xyz](https://amritesh.xyz) · Australia
 
-![A medieval night market built from my GitHub contributions, with green rooftops, glowing windows, lantern-lit stalls, and shoppers.](assets/skyline.png)
+![An animated medieval night market showing my last 20 days of GitHub contributions, with tall green castles, glowing windows, and wandering shoppers.](assets/market.gif)

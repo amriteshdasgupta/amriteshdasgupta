@@ -1,4 +1,4 @@
-"""Render an original contribution-powered medieval night market as a PNG."""
+"""Render the last 20 contribution days as an animated medieval market."""
 
 import argparse
 import json
@@ -49,13 +49,21 @@ def calendar(login):
     return user["contributionsCollection"]["contributionCalendar"]
 
 
+def recent_days(data):
+    days = sorted(
+        (day for week in data["weeks"] for day in week["contributionDays"]),
+        key=lambda day: day["date"],
+    )
+    return days[-20:]
+
+
 def render(data, output):
-    weeks = data["weeks"]
-    if not weeks:
+    selected = recent_days(data)
+    if not selected:
         raise ValueError("Contribution calendar is empty")
     # Daily buildings keep the calendar structure; the foreground market
     # and its inhabitants are decorative, rather than extra activity days.
-    width, height = 1600, 560
+    width, height = 850, 580
     image = Image.new("RGB", (width, height), "#0d1117")
     draw = ImageDraw.Draw(image)
     lights = []
@@ -66,7 +74,7 @@ def render(data, output):
     ])}
 
     def point(u, v, z=0):
-        return (round(220 + u * 24 - v * 17), round(105 + u * 4.4 + v * 13 - z))
+        return (round(355 + u * 85 - v * 45), round(160 + u * 25 + v * 35 - z))
 
     def lamp(x, y, size=2):
         draw.rectangle((x - size, y - size, x + size, y + size), fill="#ffc66d")
@@ -99,12 +107,12 @@ def render(data, output):
         draw.polygon([b, c, bottom_c, bottom_b], fill=shade(color, 0.43))
         draw.polygon([a, b, c, e], fill=color)
 
-    block(-0.4, -0.4, len(weeks) + 0.8, 11.5, -10, 7, "#26352f")
+    block(-0.25, -0.25, 5.5, 7.5, -12, 9, "#26352f")
     # Cobblestone lanes extend in front of the contribution district.
-    for u in range(len(weeks)):
-        for v in range(7, 11):
-            block(u, v, 0.91, 0.91, -2, 2, rng.choice(["#303c38", "#293630", "#344039"]))
-    days = [(i, day["weekday"], day) for i, week in enumerate(weeks) for day in week["contributionDays"]]
+    for u in range(20):
+        for v in range(28):
+            block(u / 4, v / 4, 0.23, 0.23, -2, 2, rng.choice(["#303c38", "#293630", "#344039"]))
+    days = [(i % 5, i // 5, day) for i, day in enumerate(selected)]
     peak = max([day["contributionCount"] for _, _, day in days] + [1])
     # Draw back to front so near towers correctly obscure distant ones.
     for u, v, day in sorted(days, key=lambda item: (item[0] + item[1], item[0])):
@@ -114,55 +122,53 @@ def render(data, output):
         block(u, v, 0.88, 0.88, 0, 2, greens[0])
         if not count:
             continue
-        h = 10 + round(64 * math.sqrt(count / peak))
-        if level == 1:
-            stall(u, v, color)
-            continue
+        # An exaggerated baseline makes even quiet active days substantial.
+        # Counts still control relative height and GitHub controls the greens.
+        h = 52 + round(70 * math.sqrt(count / peak))
         block(u + 0.07, v + 0.07, 0.74, 0.74, 2, h, color)
         # Thin masonry courses on both visible stone faces.
-        for z in range(10, h, 9):
+        for z in range(10, h, 12):
             draw.line([point(u + 0.07, v + 0.81, z), point(u + 0.81, v + 0.81, z),
                        point(u + 0.81, v + 0.07, z)], fill=shade(color, 0.47), width=1)
-        if level < 4:
+        if level < 3:
             # Steep green roofs over timber-framed merchant houses.
-            ridge_a, ridge_b = point(u + 0.44, v, h + 17), point(u + 0.44, v + 0.9, h + 17)
+            ridge_a, ridge_b = point(u + 0.44, v, h + 31), point(u + 0.44, v + 0.9, h + 31)
             draw.polygon([point(u - 0.05, v, h + 2), ridge_a, ridge_b, point(u - 0.05, v + 0.9, h + 2)], fill=color)
             draw.polygon([ridge_a, point(u + 0.94, v, h + 2), point(u + 0.94, v + 0.9, h + 2), ridge_b], fill=shade(color, 0.65))
             draw.line([point(u + 0.1, v + 0.82, 3), point(u + 0.76, v + 0.82, h)], fill="#92754c", width=1)
         else:
             block(u, v, 0.88, 0.88, h + 2, 3, color)
             block(u + 0.22, v + 0.22, 0.44, 0.44, h + 5, 0, "#102b1d")
-            for du, dv in [(0, 0), (0.64, 0), (0, 0.64), (0.64, 0.64)]:
-                block(u + du, v + dv, 0.24, 0.24, h + 5, 5, color)
-        for z in range(12, h, 13):
+            for du, dv in [(0, 0), (0.32, 0), (0.64, 0), (0, 0.32), (0.64, 0.32), (0, 0.64), (0.32, 0.64), (0.64, 0.64)]:
+                block(u + du, v + dv, 0.19, 0.19, h + 5, 9, color)
+        # Lit doorways and rows of leaded windows on both visible faces.
+        x, y = point(u + 0.44, v + 0.82, 2)
+        draw.rounded_rectangle((x - 5, y - 16, x + 5, y), radius=5, fill="#c8974e")
+        draw.line((x, y - 12, x, y), fill="#59432c")
+        for z in range(24, h - 5, 20):
             for du in [0.27, 0.62]:
-                lamp(*point(u + du, v + 0.82, z), size=1)
-            lamp(*point(u + 0.82, v + 0.4, z), size=1)
-        lamp(*point(u + 0.2, v + 0.86, 7), size=1)
+                x, y = point(u + du, v + 0.82, z)
+                draw.rounded_rectangle((x - 3, y - 6, x + 3, y + 4), radius=3, fill="#d9a258")
+                lamp(x, y, size=2)
+                draw.line((x - 3, y - 2, x + 3, y - 2), fill="#665335")
+            lamp(*point(u + 0.82, v + 0.4, z), size=2)
+        lamp(*point(u + 0.2, v + 0.86, 11), size=2)
         if level == 4 and count >= peak * 0.55:
             x, y = point(u + 0.1, v + 0.1, h + 10)
             draw.line((x, y, x, y - 20), fill="#83c99a", width=1)
             draw.polygon([(x + 1, y - 20), (x + 12, y - 17), (x + 1, y - 12)], fill="#39d353")
     # A lively promenade: canopies, barrels, shoppers, and hanging lanterns.
-    for u in range(len(weeks)):
-        if u % 3 != 2:
-            stall(u, 7.7, rng.choice(["#287846", "#a35943", "#b58b46", "#3e7779"]))
-        if u % 4 == 0:
-            x, y = point(u + 0.6, 9, 0)
-            draw.ellipse((x - 4, y - 6, x + 4, y + 2), fill="#805d3a", outline="#b19459")
-            draw.line((x - 4, y - 2, x + 4, y - 2), fill="#382f27")
-        for _ in range(rng.randint(1, 3)):
-            x, y = point(u + rng.random(), 9 + rng.random() * 1.5)
-            draw.ellipse((x - 3, y - 1, x + 4, y + 2), fill="#17251f")
-            draw.line((x - 1, y - 3, x - 1, y + 1), fill="#b3a58a")
-            draw.line((x + 2, y - 3, x + 2, y + 1), fill="#b3a58a")
-            draw.rectangle((x - 2, y - 8, x + 2, y - 3), fill=rng.choice(["#759c8c", "#a46c65", "#bc9d60", "#707fa1"]))
-            draw.rectangle((x - 1, y - 11, x + 1, y - 9), fill="#d7b48a")
-    for u in range(0, len(weeks), 4):
-        end = min(u + 4, len(weeks))
+    for u in range(5):
+        stall(u, 4.3, rng.choice(["#287846", "#a35943", "#b58b46", "#3e7779"]))
+        for du in [0.05, 0.8]:
+            x, y = point(u + du, 5.3, 0)
+            draw.ellipse((x - 6, y - 10, x + 6, y + 2), fill="#805d3a", outline="#b19459")
+            draw.line((x - 6, y - 3, x + 6, y - 3), fill="#382f27", width=2)
+    for u in range(5):
+        end = u + 1
         for pos in [u, end]:
-            draw.line([point(pos, 9.2), point(pos, 9.2, 39)], fill="#977950", width=2)
-        cable = [point(u + (end - u) * t / 24, 9.2, 39 - 9 * math.sin(math.pi * t / 24)) for t in range(25)]
+            draw.line([point(pos, 5.3), point(pos, 5.3, 52)], fill="#977950", width=2)
+        cable = [point(u + (end - u) * t / 24, 5.3, 52 - 9 * math.sin(math.pi * t / 24)) for t in range(25)]
         draw.line(cable, fill="#8c8260", width=1)
         for t in range(2, 24, 4):
             x, y = cable[t]
@@ -177,16 +183,46 @@ def render(data, output):
             continue
         r = size + 3
         glow_draw.ellipse((x - r, y - r, x + r, y + r), fill=(105, 60, 16))
-    image = ImageChops.add(image, glow.filter(ImageFilter.GaussianBlur(4)))
+    bloom = glow.filter(ImageFilter.GaussianBlur(4))
+    # Small looping routes and alternating footfalls give the square life.
+    shoppers = [(0.25 + rng.random() * 4.45, 5.65 + rng.random() * 0.95,
+                 rng.random() * math.tau, rng.choice(["#759c8c", "#a46c65", "#bc9d60", "#707fa1"]))
+                for _ in range(24)]
+    frames = []
+    for frame_index in range(40):
+        phase = math.tau * frame_index / 40
+        frame = ImageChops.add(image, bloom.point(lambda p: round(p * (0.94 + 0.06 * math.sin(phase)))))
+        painter = ImageDraw.Draw(frame)
+        people = []
+        for u, v, offset, coat in shoppers:
+            t = phase + offset
+            x, y = point(u + 0.2 * math.sin(t), v + 0.1 * math.cos(t))
+            people.append((y, x, t, coat))
+        for y, x, t, coat in sorted(people):
+            stride = round(2 * math.sin(t * 6))
+            painter.ellipse((x - 5, y - 2, x + 5, y + 2), fill="#17251f")
+            painter.line((x - 2, y - 5, x - 2 + stride, y), fill="#c5b08b", width=2)
+            painter.line((x + 2, y - 5, x + 2 - stride, y), fill="#c5b08b", width=2)
+            painter.rectangle((x - 3, y - 13, x + 3, y - 5), fill=coat)
+            painter.line((x - 4, y - 11, x - 5 + stride, y - 6), fill="#d7b48a", width=2)
+            painter.rectangle((x - 2, y - 18, x + 2, y - 14), fill="#d7b48a")
+            painter.rectangle((x - 3, y - 19, x + 2, y - 18), fill="#514236")
+        frames.append(frame)
+    # Shared palette prevents color shimmer between frames.
+    palette = frames[0].quantize(colors=256)
+    frames = [frame.quantize(palette=palette, dither=Image.Dither.NONE)
+              .resize((width * 2, height * 2), Image.Resampling.NEAREST) for frame in frames]
     output.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output, optimize=True)
+    frames[0].save(output, save_all=True, append_images=frames[1:], duration=100,
+                   loop=0, optimize=False, disposal=1)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--username", default="amriteshdasgupta")
-    parser.add_argument("--output", type=Path, default=ROOT / "assets" / "skyline.png")
+    parser.add_argument("--output", type=Path, default=ROOT / "assets" / "market.gif")
     args = parser.parse_args()
     data = calendar(args.username)
     render(data, args.output)
-    print(f"Rendered {len(data['weeks'])} weeks / {data['totalContributions']} contributions to {args.output}")
+    days = recent_days(data)
+    print(f"Rendered {len(days)} days ({days[0]['date']} to {days[-1]['date']}) to {args.output}")
