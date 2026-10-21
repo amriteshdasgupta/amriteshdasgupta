@@ -2,6 +2,6 @@
 
 [amritesh.xyz](https://amritesh.xyz) · Australia
 
-![A pixel-art skyline of my GitHub contributions, with warm windows above a quiet waterfront.](assets/skyline.png)
+![The Contribution Keep: an isometric medieval fortress built from my GitHub activity, with green crenellated towers for active days.](assets/skyline.png)
 
-<sub>A year of building, by the water. Each building represents a week of GitHub activity; height reflects contributions. Updated daily.</sub>
+<sub>A little more built each day. Each tile is a day; greener, taller towers mean more contributions. Updated daily.</sub>
