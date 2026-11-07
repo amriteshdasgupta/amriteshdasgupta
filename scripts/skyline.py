@@ -16,7 +16,7 @@ import subprocess
 import urllib.request
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 QUERY = """
 query($login: String!) {
@@ -99,25 +99,6 @@ def rgb(hex_color):
 PALETTE = np.zeros((40, 3), np.float32)
 for _mat, _hex in BASE.items():
     PALETTE[_mat] = rgb(_hex)
-
-# 3x5 pixel font for the caption.
-FONT = {
-    "A": "010101111101101", "B": "110101110101110", "C": "011100100100011",
-    "D": "110101101101110", "E": "111100110100111", "F": "111100110100100",
-    "G": "011100101101011", "H": "101101111101101", "I": "111010010010111",
-    "J": "001001001101010", "K": "101101110101101", "L": "100100100100111",
-    "M": "101111111101101", "N": "110101101101101", "O": "010101101101010",
-    "P": "110101110100100", "Q": "010101101110011", "R": "110101110101101",
-    "S": "011100010001110", "T": "111010010010010", "U": "101101101101111",
-    "V": "101101101101010", "W": "101101111111101", "X": "101101010101101",
-    "Y": "101101010010010", "Z": "111001010100111", "0": "111101101101111",
-    "1": "010110010010111", "2": "110001010100111", "3": "110001010001110",
-    "4": "101101111001001", "5": "111100110001110", "6": "011100111101111",
-    "7": "111001010010010", "8": "111101111101111", "9": "111101111001110",
-    "-": "000000111000000", ".": "000000000000010", ":": "000010000010000",
-    "/": "001001010100100", " ": "000000000000000", "'": "010010000000000",
-    "+": "000010111010000",
-}
 
 
 class World:
@@ -614,17 +595,42 @@ def build_scene(selected, seed=1729):
 # Rasteriser
 # ---------------------------------------------------------------------------
 
-WIDTH, HEIGHT, SCALE = 520, 460, 3
-OX, OY = 2 * SY + (WIDTH - 2 * (SX + SY)) // 2 + 4, 205
+K = 3                       # screen pixels per unit of the isometric grid
+NW, NH = 520, 460           # canvas size in grid units
+WIDTH, HEIGHT = NW * K, NH * K
+OX, OY = (2 * SY + (NW - 2 * (SX + SY)) // 2 + 4) * K, 205 * K
 LIGHT = np.array([-1.0, 0.55, 0.9])
+PX = 1.0 / (2 * K)          # one screen pixel, measured in voxels
 
 
 def project(x, y, z):
-    return 2 * (x - y) + OX, (x + y) - 2 * z + OY
+    return 2 * K * (x - y) + OX, K * (x + y) - 2 * K * z + OY
+
+
+def cube_template():
+    """Pixels of one voxel's on-screen hexagon as (face, dx, dy, s, t).
+
+    Face 0 is the top, 1 the +y side (left) and 2 the +x side (right). s and t
+    place the pixel on its face, each running 0..1: along x and y on the top,
+    along the face and down from its top edge on the sides.
+    """
+    cells = []
+    for dy in range(4 * K):
+        for dx in range(-2 * K, 2 * K):
+            a, b = dx + 0.5, dy + 0.5
+            if abs(a) / (2 * K) + abs(b - K) / K < 1:
+                cells.append((0, dx, dy, (a / (2 * K) + b / K) / 2, (b / K - a / (2 * K)) / 2))
+            elif a < 0 and 2 * K + a / 2 < b < 4 * K + a / 2:
+                s = 1 + a / (2 * K)
+                cells.append((1, dx, dy, s, (b - K * (1 + s)) / (2 * K)))
+            elif a > 0 and 2 * K - a / 2 < b < 4 * K - a / 2:
+                s = 1 - a / (2 * K)
+                cells.append((2, dx, dy, s, (b - K * (1 + s)) / (2 * K)))
+    return cells
 
 
 def hash_noise(*arrays):
-    arrays = np.broadcast_arrays(*[np.asarray(a, np.int64) for a in arrays])
+    arrays = np.broadcast_arrays(*[np.asarray(a).astype(np.int64) for a in arrays])
     h = np.zeros(arrays[0].shape, np.uint32)
     for k, a in enumerate(arrays):
         h ^= (a * [73856093, 19349663, 83492791, 2654435761][k] & 0xFFFFFFFF).astype(np.uint32)
@@ -679,9 +685,7 @@ def render_static(w):
         f = np.clip(1 - d / radius, 0, 1) ** 2 * strength
         warm[idx] += f[:, None] * np.array(color, np.float32)[None, :] / 255.0
 
-    base = PALETTE[m].copy()
-    jitter = 0.9 + 0.2 * hash_noise(xs, ys, zs)
-    base *= jitter[:, None]
+    base = PALETTE[m] * (0.95 + 0.1 * hash_noise(xs, ys, zs))[:, None]
     # Underside of the island fades into the night.
     under = np.clip((G - zs) / G, 0, 1)
     base *= (1 - 0.55 * under)[:, None]
@@ -691,79 +695,122 @@ def render_static(w):
     depth = np.full((HEIGHT, WIDTH), -1e9, np.float32)
     kind = np.zeros((HEIGHT, WIDTH), np.int32)       # material
     ident = np.zeros((HEIGHT, WIDTH), np.int32)      # light/window id
+    glaze = np.ones((HEIGHT, WIDTH), np.float32)     # surface detail under glowing pixels
     sx, sy = project(xs, ys, zs)
+    top = sy - 2 * K
     shade = [1.0, 0.74, 0.52]
     moon_tint = np.array([0.80, 0.86, 1.04], np.float32)
-    for face, (rows, cols) in enumerate([((0, 1), (0, 1, 2, 3)), ((2, 3), (0, 1)), ((2, 3), (2, 3))]):
+    cells = cube_template()
+    for face in range(3):
         sel = np.nonzero(faces[face])[0]
         if not len(sel):
             continue
         light = shade[face] * (0.55 + 0.45 * lit[sel]) * ao[sel]
         if face == 2:
             light = shade[face] * ao[sel] * (0.8 + 0.2 * lit[sel])
-        for r in rows:
-            for c in cols:
-                col = base[sel] * moon_tint * light[:, None]
-                tex = texture(m[sel], face, xs[sel], ys[sel], zs[sel], r, c)
-                col *= tex[:, None]
-                col += warm[sel] * PALETTE[m[sel]] * 0.6 * (1.0 if face == 0 else 0.8)
-                em = emissive[sel]
-                col[em] = PALETTE[m[sel][em]] * (1.0 if face != 2 else 0.85)
-                X = sx[sel] - 2 + c
-                Y = sy[sel] - 2 + r
-                dep = (xs[sel] + ys[sel] + zs[sel]).astype(np.float32) + (0.01 if face else 0.0)
-                ok = (X >= 0) & (X < WIDTH) & (Y >= 0) & (Y < HEIGHT)
-                X, Y, dep, colv = X[ok], Y[ok], dep[ok], col[ok]
-                mm, ww = m[sel][ok], wid[sel][ok]
-                order = np.argsort(dep, kind="stable")
-                X, Y, dep, colv, mm, ww = X[order], Y[order], dep[order], colv[order], mm[order], ww[order]
-                # Keep the nearest sample per pixel (last write wins after sort).
-                flat = Y * WIDTH + X
-                _, last = np.unique(flat[::-1], return_index=True)
-                last = len(flat) - 1 - last
-                fx, fy, fd = X[last], Y[last], dep[last]
-                better = fd >= depth[fy, fx]
-                fx, fy, last = fx[better], fy[better], last[better]
-                depth[fy, fx] = dep[last]
-                canvas[fy, fx] = colv[last]
-                kind[fy, fx] = mm[last]
-                ident[fy, fx] = ww[last]
-    return canvas, depth, kind, ident
+        ms, fx, fy, fz = m[sel], xs[sel], ys[sel], zs[sel]
+        lit_col = base[sel] * moon_tint * light[:, None]
+        warm_col = warm[sel] * PALETTE[ms] * 0.6 * (1.0 if face == 0 else 0.8)
+        own = PALETTE[ms] * (1.0 if face != 2 else 0.85)
+        em = emissive[sel]
+        dep_all = (fx + fy + fz).astype(np.float32)
+        edge_x, edge_y = faces[2][sel], faces[1][sel]
+        for f, dx, dy, s, t in cells:
+            if f != face:
+                continue
+            X = sx[sel] + dx
+            Y = top[sel] + dy
+            tex = texture(ms, face, fx, fy, fz, s, t, X, Y, edge_x, edge_y)
+            col = lit_col * tex[:, None] + warm_col
+            col[em] = own[em] * tex[em, None]
+            ok = (X >= 0) & (X < WIDTH) & (Y >= 0) & (Y < HEIGHT)
+            X, Y, dep, colv = X[ok], Y[ok], dep_all[ok], col[ok]
+            mm, ww, tt = ms[ok], wid[sel][ok], tex[ok]
+            order = np.argsort(dep, kind="stable")
+            X, Y, dep, colv, mm, ww, tt = (a[order] for a in (X, Y, dep, colv, mm, ww, tt))
+            # Keep the nearest sample per pixel (last write wins after sort).
+            flat = Y * WIDTH + X
+            _, last = np.unique(flat[::-1], return_index=True)
+            last = len(flat) - 1 - last
+            px_, py_, fd = X[last], Y[last], dep[last]
+            better = fd >= depth[py_, px_]
+            px_, py_, last = px_[better], py_[better], last[better]
+            depth[py_, px_] = dep[last]
+            canvas[py_, px_] = colv[last]
+            kind[py_, px_] = mm[last]
+            ident[py_, px_] = ww[last]
+            glaze[py_, px_] = tt[last]
+    return canvas, depth, kind, ident, glaze
 
 
-def texture(m, face, x, y, z, r, c):
-    t = np.ones(len(m), np.float32)
-    along = np.where(face == 1, x, y) if face else x
-    # Brick courses on stone walls.
+def texture(m, face, x, y, z, s, t, X, Y, edge_x, edge_y):
+    """Brightness of the surface detail at one pixel of each voxel's face."""
+    tex = np.ones(len(m), np.float32)
+    grain = hash_noise(X, Y, 7)
     stone = (m == STONE) | (m == STONE2)
-    if face:
-        course = z % 2
-        joint = ((along * 2 + c + course * 2) % 4 == 0)
-        mortar = (r == 3) & (course == 0) | joint & (r == 2)
-        brick = hash_noise(along // 2 + course * 7, z // 2 * 3 + along % 2 * 0, x * 0 + y * 0 + 11)
-        t = np.where(stone, np.where(mortar, 0.72, 0.92 + 0.16 * brick), t)
-        # Roof tile lines.
-        roof = np.isin(m, ROOFS + [SLATE])
-        t = np.where(roof & (r == 3), 0.72, t)
-        # Plaster wear.
-        plaster = m == PLASTER
-        t = np.where(plaster, 0.95 + 0.07 * hash_noise(x * 3 + c, y * 5 + r, z), t)
-        rock = (m == ROCK) | (m == ROCK2)
-        t = np.where(rock, 0.85 + 0.25 * hash_noise(x + c * 31, y + r * 17, z), t)
-        wood = (m == WOOD) | (m == DOOR) | (m == TIMBER)
-        t = np.where(wood & (c == 1 if face == 1 else c == 3), 0.8, t)
+    roofs = np.isin(m, ROOFS + [SLATE])
+    # The face's point in world space, for patterns that run across voxels.
+    if face == 0:
+        wx, wy, wz = x + s, y + t, z + 1.0
+    elif face == 1:
+        wx, wy, wz = x + s, y + 1.0, z + 1 - t
     else:
-        cob = m == COBBLE
-        t = np.where(cob, np.where((c == 0) & (r == 1), 0.7, 0.88 + 0.22 * hash_noise(x + c // 2, y, r)), t)
-        roof = np.isin(m, ROOFS + [SLATE])
-        t = np.where(roof & (r == 1) & (c % 2 == 0), 0.85, t)
-        grass = (m == GRASS) | (m == LEAVES) | (m == PINE) | (m == MOSS)
-        t = np.where(grass, 0.82 + 0.36 * hash_noise(x * 4 + c, y * 4 + r, z), t)
-        stone_top = stone & (r == 1) & (c == 0)
-        t = np.where(stone_top, 0.8, t)
+        wx, wy, wz = x + 1.0, y + s, z + 1 - t
+    clumps = hash_noise(np.floor(wx * 3), np.floor(wy * 3), np.floor(wz * 3))
+    if face:
+        along = wx if face == 1 else wy
+        # Ashlar in half-voxel courses, laid in running bond.
+        course = np.floor(wz * 2)
+        cu = wz * 2 - course
+        run = along + 0.5 * (course % 2)
+        block = np.floor(run)
+        joint = (cu < 2 * PX) | (run - block < PX)
+        ashlar = 0.9 + 0.16 * hash_noise(block, course, face) + 0.05 * grain
+        ashlar = np.where(cu > 1 - 2 * PX, ashlar * 1.1, ashlar)
+        tex = np.where(stone, np.where(joint, 0.68, ashlar), tex)
+        # Overlapping roof tiles.
+        tile = np.where(cu < 2 * PX, 0.7, np.where((run * 2) % 1 < 2 * PX, 0.85, 0.95 + 0.08 * grain))
+        tex = np.where(roofs, tile, tex)
+        tex = np.where(m == PLASTER, 0.95 + 0.07 * grain, tex)
+        rock = (m == ROCK) | (m == ROCK2)
+        tex = np.where(rock, 0.8 + 0.22 * clumps + 0.08 * grain, tex)
+        planks = (m == WOOD) | (m == DOOR)
+        seam = (along * 2) % 1 < 2 * PX
+        streak = hash_noise(np.floor(along * 2 * K), face, 9)
+        tex = np.where(planks, np.where(seam, 0.75, 0.9 + 0.14 * streak), tex)
+        tex = np.where(m == TIMBER, 0.88 + 0.14 * streak, tex)
+        # Leaded panes, and lanterns under an iron cap.
+        lead = (s < PX) | (s > 1 - PX) | (t > 1 - 2 * PX)
+        tex = np.where(m == WINDOW, np.where(lead, 0.32, 1.06 - 0.12 * t), tex)
+        tex = np.where(m == LANTERN, np.where(t < 2 * PX, 0.4, 1.05 - 0.15 * t), tex)
+        if face == 2:
+            # A crisp highlight down each exposed front corner.
+            rim = (s > 1 - PX) & edge_y & ~np.isin(m, list(EMISSIVE) + [LEAVES, PINE])
+            tex = np.where(rim, tex * 1.16, tex)
+    else:
+        # Cobbles in staggered half-voxel rows.
+        row = np.floor(wy * 2)
+        run = wx * 2 + 0.5 * (row % 2)
+        cell = np.floor(run)
+        gap = (wy * 2 - row < 2 * PX) | (run - cell < 2 * PX)
+        tex = np.where(m == COBBLE, np.where(gap, 0.6, 0.84 + 0.24 * hash_noise(cell, row, 3)), tex)
+        # Flagstones on wall walks, tile rows on roofs.
+        slab = (wx % 1 < PX) | (wy % 1 < PX)
+        tex = np.where(stone, np.where(slab, 0.8, 0.94 + 0.08 * grain), tex)
+        tiles = ((wx * 2) % 1 < 2 * PX) | ((wy * 2) % 1 < 2 * PX)
+        tex = np.where(roofs, np.where(tiles, 0.84, 0.95 + 0.08 * grain), tex)
+        grassy = (m == GRASS) | (m == MOSS)
+        tex = np.where(grassy, 0.8 + 0.22 * clumps + 0.16 * grain, tex)
+        tex = np.where(m == PATH, 0.88 + 0.2 * grain, tex)
+        tex = np.where((m == WOOD) | (m == DOOR), np.where((wx * 2) % 1 < 2 * PX, 0.78, 0.95), tex)
+        tex = np.where(m == LANTERN, 0.5, tex)
+        # Light catches the front edges of every exposed top.
+        rim = ((s > 1 - PX) & edge_x) | ((t > 1 - PX) & edge_y)
+        rim &= ~np.isin(m, list(EMISSIVE) + [LEAVES, PINE, WATER])
+        tex = np.where(rim, tex * 1.18, tex)
     leaves = (m == LEAVES) | (m == PINE)
-    t = np.where(leaves, 0.75 + 0.5 * hash_noise(x * 2 + c, y * 2 + r, z * 3 + face), t)
-    return t
+    tex = np.where(leaves, 0.72 + 0.4 * clumps + 0.16 * grain, tex)
+    return tex
 
 
 # ---------------------------------------------------------------------------
@@ -780,13 +827,13 @@ def sky(rng):
     cols = np.array([rgb(c) for _, c in stops], np.float32)
     pos = np.array([p for p, _ in stops])
     # Quantise to bands, dithered between neighbours.
-    bands = 14
+    bands = 28
     v = t * bands + BAYER[ys % 4, xs % 4] - 0.5
     tq = np.clip(np.floor(v + 0.5) / bands, 0, 1)
     img = np.stack([np.interp(tq, pos, cols[:, k]) for k in range(3)], axis=-1)
     stars = []
     for _ in range(170):
-        x, y = rng.randrange(WIDTH), rng.randrange(int(HEIGHT * 0.85))
+        x, y = rng.randrange(NW) * K + 1, rng.randrange(int(NH * 0.85)) * K + 1
         stars.append((x, y, rng.random(), rng.choice([0.5, 0.7, 1.0, 1.0, 1.4])))
     return img.astype(np.float32), stars
 
@@ -795,24 +842,27 @@ def moon(img, cx, cy, r):
     ys, xs = np.mgrid[0:HEIGHT, 0:WIDTH]
     d = np.hypot(xs - cx, ys - cy)
     halo = np.clip(1 - (d - r) / (r * 2.2), 0, 1) ** 2 * 0.45
-    halo = np.floor(halo * 6 + BAYER[ys % 4, xs % 4]) / 6
+    halo = np.floor(halo * 12 + BAYER[ys % 4, xs % 4]) / 12
     img += halo[..., None] * np.array([70, 80, 120], np.float32)
-    disc = d <= r
     shade = np.clip(1 - np.hypot(xs - cx + r * 0.35, ys - cy + r * 0.35) / (r * 2.4), 0, 1)
     col = np.array([236, 230, 205], np.float32) * (0.78 + 0.22 * shade[..., None])
     for mx, my, mr in [(-4, -3, 3.5), (5, 2, 2.5), (1, 7, 2)]:
-        crater = np.hypot(xs - cx - mx, ys - cy - my) <= mr
-        col = np.where(crater[..., None], col * 0.9, col)
-    img[disc] = col[disc]
-    return disc
+        k = r / 14
+        dist = np.hypot(xs - cx - mx * k, ys - cy - my * k)
+        crater = np.clip(mr * k - dist + 0.5, 0, 1) * 0.1
+        col *= (1 - crater)[..., None]
+    # Anti-aliased rim.
+    cover = np.clip(r - d + 0.5, 0, 1)[..., None]
+    img[:] = img * (1 - cover) + col * cover
+    return d <= r
 
 
 def clouds(img, rng, y_min, y_max, count, tones, width=(30, 90)):
-    """Puffy pixel-art cumulus: unions of circles with a flat base."""
+    """Puffy cumulus: unions of circles with a flat base, lit from above."""
     ys, xs = np.mgrid[0:HEIGHT, 0:WIDTH]
     mask = np.zeros((HEIGHT, WIDTH), bool)
     for _ in range(count):
-        cx, base = rng.uniform(-20, WIDTH + 20), rng.uniform(y_min, y_max)
+        cx, base = rng.uniform(-20, NW + 20), rng.uniform(y_min, y_max)
         span = rng.uniform(*width)
         for _ in range(int(span / 7) + 2):
             px = cx + rng.uniform(-span / 2, span / 2)
@@ -820,10 +870,16 @@ def clouds(img, rng, y_min, y_max, count, tones, width=(30, 90)):
             if r < 2:
                 continue
             py = base - r * rng.uniform(0.2, 0.6)
-            mask |= ((xs - px) ** 2 + ((ys - py) * 1.15) ** 2 <= r * r) & (ys <= base)
-    lit = mask & ~np.roll(mask, 2, axis=0)
-    rim = mask & ~np.roll(mask, 4, axis=0) & ~lit
-    dark = mask & ~np.roll(mask, -3, axis=0)
+            x0, x1 = max(0, int((px - r) * K)), min(WIDTH, int((px + r) * K) + 1)
+            y0, y1 = max(0, int((py - r) * K)), min(HEIGHT, int(base * K) + 1)
+            if x0 >= x1 or y0 >= y1:
+                continue
+            sx, sy = xs[y0:y1, x0:x1], ys[y0:y1, x0:x1]
+            mask[y0:y1, x0:x1] |= (((sx - px * K) ** 2 + ((sy - py * K) * 1.15) ** 2 <= (r * K) ** 2)
+                                   & (sy <= base * K))
+    lit = mask & ~np.roll(mask, 2 * K, axis=0)
+    rim = mask & ~np.roll(mask, 4 * K, axis=0) & ~lit
+    dark = mask & ~np.roll(mask, -3 * K, axis=0)
     img[mask] = tones[0]
     img[rim & (BAYER[ys % 4, xs % 4] < 0.5)] = tones[2] * 0.85 + tones[0] * 0.15
     img[lit] = tones[2]
@@ -831,15 +887,35 @@ def clouds(img, rng, y_min, y_max, count, tones, width=(30, 90)):
     return mask
 
 
-def text(img, s, x, y, color, scale=1):
-    for ch in s.upper():
-        glyph = FONT.get(ch, FONT[" "])
-        for k, bit in enumerate(glyph):
-            if bit == "1":
-                gx, gy = x + (k % 3) * scale, y + (k // 3) * scale
-                img[gy:gy + scale, gx:gx + scale] = color
-        x += 4 * scale
-    return x
+def caption(username, total):
+    """The label as an anti-aliased overlay: (alpha, colour, top-left)."""
+    layer = Image.new("RGBA", (WIDTH, 30 * K))
+    draw = ImageDraw.Draw(layer)
+    title = ImageFont.load_default(size=7 * K)
+    small = ImageFont.load_default(size=6 * K)
+    x, y = 12 * K, 2 * K
+    draw.text((x, y), f"{(username or '').lower()}  ·  last 20 days", font=title, fill=(214, 219, 238, 255))
+    label = f"{total} contributions"
+    draw.text((x, y + 10 * K), label, font=small, fill=(150, 160, 192, 255))
+    x += draw.textlength(label, font=small) + 4 * K
+    for lvl in range(5):
+        x0 = int(x + lvl * 6 * K)
+        draw.rounded_rectangle((x0, y + 11 * K + 2, x0 + 4 * K, y + 15 * K + 2), radius=2,
+                               fill=tuple(rgb(GREENS[lvl])) + (255,))
+    pixels = np.asarray(layer, np.float32)
+    return pixels[..., 3:] / 255.0, pixels[..., :3], HEIGHT - 30 * K
+
+
+def disc(frame, cx, cy, radius, color, alpha):
+    """Blend a soft round puff into the frame."""
+    x0, x1 = max(0, int(cx - radius - 1)), min(WIDTH, int(cx + radius + 2))
+    y0, y1 = max(0, int(cy - radius - 1)), min(HEIGHT, int(cy + radius + 2))
+    if x0 >= x1 or y0 >= y1:
+        return
+    ys, xs = np.mgrid[y0:y1, x0:x1]
+    dist = np.hypot(xs + 0.5 - cx, ys + 0.5 - cy)
+    a = np.clip((radius - dist) / (radius * 0.6) + 0.2, 0, 1)[..., None] * alpha
+    frame[y0:y1, x0:x1] = frame[y0:y1, x0:x1] * (1 - a) + np.asarray(color, np.float32) * a
 
 
 def render(data, output, username=None):
@@ -849,17 +925,18 @@ def render(data, output, username=None):
         raise ValueError("Contribution calendar is empty")
     rng = random.Random(824)
     world = build_scene(selected)
-    canvas, depth, kind, ident = render_static(world)
+    canvas, depth, kind, ident, glaze = render_static(world)
     background, stars = sky(rng)
-    moon_mask = moon(background, 76, 70, 14)
+    moon_mask = moon(background, 76 * K, 70 * K, 14 * K)
     clouds(background, rng, 95, 150, 7,
            [np.array(rgb(c), np.float32) for c in ("#1a1d3d", "#141733", "#2c3060")], (20, 60))
-    clouds(background, rng, HEIGHT - 40, HEIGHT - 20, 12,
+    clouds(background, rng, NH - 40, NH - 20, 12,
            [np.array(rgb(c), np.float32) for c in ("#2a2955", "#211f45", "#4b4c86")], (50, 110))
-    clouds(background, rng, HEIGHT + 5, HEIGHT + 25, 14,
+    clouds(background, rng, NH + 5, NH + 25, 14,
            [np.array(rgb(c), np.float32) for c in ("#35336a", "#2a2856", "#5d5f9e")], (60, 130))
     scene = depth > -1e8
     total = sum(day["contributionCount"] for day in selected)
+    label_alpha, label_color, label_y = caption(username, total)
 
     window_phase = {}
     wrng = random.Random(3)
@@ -867,13 +944,17 @@ def render(data, output, username=None):
         window_phase[i] = (wrng.random() * math.tau, wrng.choice([1, 1, 1, 2, 3]), wrng.random())
     win_ids = np.unique(ident[(kind == WINDOW) & (ident > 0)])
     window_px = {i: np.nonzero(ident == i) for i in win_ids}
+    lantern = (kind == LANTERN) & scene
+    beacon = (kind == BEACON) & scene
     water = (kind == WATER) & scene
-    fall = (kind == FALL) & scene
-    sparkle_seed = np.random.default_rng(11).random((HEIGHT, WIDTH))
+    fall_y, fall_x = np.nonzero((kind == FALL) & scene)
     ys_grid, xs_grid = np.mgrid[0:HEIGHT, 0:WIDTH]
+    glints = hash_noise(ys_grid, xs_grid // 4, 11)
+    fall_seed = (hash_noise(fall_x // 2, 0, 5) * 9 * K).astype(int)
 
-    bats = [(rng.uniform(40, 140), rng.uniform(40, 100), rng.uniform(14, 30), rng.random() * math.tau,
-             rng.choice([1, -1])) for _ in range(4)]
+    bats = [(rng.uniform(40, 140) * K, rng.uniform(40, 100) * K, rng.uniform(14, 30) * K,
+             rng.random() * math.tau, rng.choice([1, -1])) for _ in range(4)]
+    fx0, fy0 = project(ISL_X, 48, 2)
 
     frames = []
     n_frames = 96
@@ -884,18 +965,25 @@ def render(data, output, username=None):
             tw = 0.55 + 0.45 * math.sin(phase * 2 + p * math.tau)
             if moon_mask[y, x]:
                 continue
-            img[y, x] = np.maximum(img[y, x], np.array([200, 210, 255]) * min(1, b * tw))
-            if b > 1.2 and tw > 0.8:
+            col = np.array([200, 210, 255], np.float32) * min(1, b * tw)
+            img[y, x] = np.maximum(img[y, x], col)
+            if b >= 1.0:
                 for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                    if 0 <= x + dx < WIDTH and 0 <= y + dy < HEIGHT:
-                        img[y + dy, x + dx] = np.maximum(img[y + dy, x + dx], [90, 100, 150])
+                    img[y + dy, x + dx] = np.maximum(img[y + dy, x + dx], col * 0.45)
+            if b > 1.2 and tw > 0.8:
+                for k in (2, 3):
+                    for dx, dy in [(-k, 0), (k, 0), (0, -k), (0, k)]:
+                        if 0 <= x + dx < WIDTH and 0 <= y + dy < HEIGHT:
+                            img[y + dy, x + dx] = np.maximum(img[y + dy, x + dx], col * (0.5 / k))
         # Bats circling in front of the moon.
         for bx, by, br, bp, bd in bats:
             a = phase * bd + bp
             x = int(bx + br * math.cos(a))
             y = int(by + br * 0.45 * math.sin(a * 2))
-            flap = (f // 2 + int(bp * 10)) % 2
-            pix = [(0, 0), (-1, -1 + flap), (1, -1 + flap), (-2, -flap), (2, -flap)]
+            up = (f // 2 + int(bp * 10)) % 2
+            wing = [(1, 0), (2, -1), (3, -2), (4, -2)] if up else [(1, 0), (2, 0), (3, 1), (4, 2)]
+            pix = [(0, 0), (0, 1), (-1, 0), (1, 0), (-1, -1), (1, -1)]
+            pix += [(dx, dy) for dx, dy in wing] + [(-dx, dy) for dx, dy in wing]
             for dx, dy in pix:
                 if 0 <= x + dx < WIDTH and 0 <= y + dy < HEIGHT:
                     img[y + dy, x + dx] = [12, 10, 18]
@@ -907,77 +995,52 @@ def render(data, output, username=None):
             p, speed, base = window_phase.get(i, (0, 1, 0.5))
             k = 0.86 + 0.1 * math.sin(phase * speed + p) + 0.04 * math.sin(phase * speed * 3 + p * 2)
             col = np.array([255, 196 + 20 * base, 100 + 30 * base], np.float32) * k
-            frame[yy, xx] = col
-            glow[yy, xx] = col
-        glow[(kind == LANTERN) & scene] = PALETTE[LANTERN]
-        bk = (kind == BEACON) & scene
-        frame[bk] = [255, 150 + 60 * (0.5 + 0.5 * math.sin(phase * 4)), 60]
-        glow[bk] = [255, 160, 60]
+            lit = col[None, :] * glaze[yy, xx][:, None]
+            frame[yy, xx] = lit
+            glow[yy, xx] = lit
+        glow[lantern] = PALETTE[LANTERN] * glaze[lantern][:, None]
+        frame[beacon] = [255, 150 + 60 * (0.5 + 0.5 * math.sin(phase * 4)), 60]
+        glow[beacon] = [255, 160, 60]
         glow[moon_mask] = [90, 90, 80]
-        # Water sparkle on the moat and a falling waterfall.
-        sp = water & (((sparkle_seed + f / n_frames) % 1.0) < 0.06)
+        # Glints on the moat and a falling waterfall.
+        sp = water & (((glints + f / n_frames) % 1.0) < 0.04)
         frame[sp] = [150, 190, 220]
-        if fall.any():
-            stripe = (ys_grid - f * 3 + (sparkle_seed[0, xs_grid] * 9).astype(int)) % 9
-            fcol = np.where((stripe < 2)[..., None], [190, 225, 250], np.where((stripe < 5)[..., None],
-                            [90, 150, 205], [50, 100, 160]))
-            frame[fall] = fcol[fall]
+        if len(fall_y):
+            stripe = (fall_y - f * 3 * K + fall_seed) % (9 * K)
+            frame[fall_y, fall_x] = np.where((stripe < 2 * K)[:, None], [190, 225, 250],
+                                             np.where((stripe < 5 * K)[:, None], [90, 150, 205],
+                                                      [50, 100, 160]))
         # Mist where the waterfall leaves the island.
-        _, fy0 = project(ISL_X, 48, 2)
-        fx0, _ = project(ISL_X, 48, 2)
         mist_rng = random.Random(77)
         for k in range(26):
             p = (f / n_frames + k / 26) % 1.0
-            mx = fx0 + mist_rng.uniform(-6, 6) + p * mist_rng.uniform(-8, 8)
-            my = fy0 + p * 26 + mist_rng.uniform(-2, 2)
-            a = (1 - p) * 0.6
-            for dx in range(2):
-                for dy in range(2):
-                    X, Y = int(mx) + dx, int(my) + dy
-                    if 0 <= X < WIDTH and 0 <= Y < HEIGHT:
-                        frame[Y, X] = frame[Y, X] * (1 - a) + np.array([170, 200, 230]) * a
+            mx = fx0 + (mist_rng.uniform(-6, 6) + p * mist_rng.uniform(-8, 8)) * K
+            my = fy0 + (p * 26 + mist_rng.uniform(-2, 2)) * K
+            disc(frame, mx, my, K * (1.2 + 2 * p), [170, 200, 230], (1 - p) * 0.3)
         # Waving flags.
         for fx, fy, fz, length, color in world.flags:
-            c = np.array(rgb(color), np.float32)
-            for i in range(length):
-                for j in range(2):
-                    wave = math.sin(phase * 2 - i * 0.9)
-                    X, Y = project(fx + 0.5 + i * 0.55, fy + 0.5 - i * 0.55, fz - j)
-                    Y += int(round(wave * 1.2))
-                    shade = 0.8 + 0.25 * wave
-                    for dx in range(2):
-                        put(frame, frame_depth, X + dx, Y, fx + fy + fz + 50, c * shade)
-            # Pole.
-            for zz in range(3):
-                X, Y = project(fx + 0.5, fy + 0.5, fz - 2 + zz)
-                put(frame, frame_depth, X, Y, fx + fy + fz, np.array([120, 110, 100], np.float32))
+            draw_flag(frame, frame_depth, fx, fy, fz, length, color, phase)
         # Chimney smoke.
         for k, (cx, cy, cz) in enumerate(world.smoke):
             X0, Y0 = project(cx, cy, cz)
             for puff in range(5):
                 p = (f / n_frames * 2 + puff / 5 + k * 0.17) % 1.0
-                X = X0 + int(p * 10 + math.sin(p * 6 + k) * 2)
-                Y = Y0 - int(p * 22)
-                a = 0.5 * (1 - p)
-                size = 1 + int(p * 3)
-                for dx in range(size):
-                    for dy in range(size):
-                        if 0 <= X + dx < WIDTH and 0 <= Y + dy < HEIGHT:
-                            frame[Y + dy, X + dx] = frame[Y + dy, X + dx] * (1 - a) + np.array([120, 120, 140]) * a
+                X = X0 + (p * 10 + math.sin(p * 6 + k) * 2) * K
+                Y = Y0 - p * 22 * K
+                disc(frame, X, Y, K * (0.6 + p * 1.6), [120, 120, 140], 0.5 * (1 - p))
         # People.
         for wk in world.walkers:
             draw_walker(frame, frame_depth, glow, wk, f, n_frames, phase)
-        # Bloom.
-        g = Image.fromarray(np.clip(glow, 0, 255).astype(np.uint8))
-        bloom = (np.asarray(g.filter(ImageFilter.GaussianBlur(3)), np.float32) * 1.4 +
-                 np.asarray(g.filter(ImageFilter.GaussianBlur(9)), np.float32) * 0.9)
+        # Bloom, blurred at grid resolution and scaled back up smoothly.
+        g = Image.fromarray(np.clip(glow, 0, 255).astype(np.uint8)).resize((NW, NH), Image.Resampling.BOX)
+        bloom = (np.asarray(g.filter(ImageFilter.GaussianBlur(3)), np.float32) * 1.9 +
+                 np.asarray(g.filter(ImageFilter.GaussianBlur(9)), np.float32) * 1.2)
+        bloom = np.asarray(Image.fromarray(np.clip(bloom, 0, 255).astype(np.uint8))
+                           .resize((WIDTH, HEIGHT), Image.Resampling.BILINEAR), np.float32)
         frame = frame + bloom * np.array([1.0, 0.85, 0.6])
         # Caption.
-        label = f"{(username or '').upper()}  LAST 20 DAYS"
-        text(frame, label, 12, HEIGHT - 26, np.array([210, 215, 235], np.float32))
-        x = text(frame, f"{total} CONTRIBUTIONS", 12, HEIGHT - 18, np.array([150, 160, 190], np.float32))
-        for lvl in range(5):
-            frame[HEIGHT - 17:HEIGHT - 13, x + 4 + lvl * 6:x + 8 + lvl * 6] = rgb(GREENS[lvl])
+        band = frame[label_y:]
+        band[:] = band * (1 - label_alpha) + label_color * label_alpha
         frames.append(Image.fromarray(np.clip(frame, 0, 255).astype(np.uint8)))
 
     # Shared palette prevents colour shimmer between frames.
@@ -992,22 +1055,44 @@ def render(data, output, username=None):
         data = idx.copy()
         if k:
             data[idx == indexed[k - 1]] = 255
-        im = Image.fromarray(data.astype(np.uint8), "P")
+        im = Image.frombytes("P", (WIDTH, HEIGHT), data.astype(np.uint8).tobytes())
         im.putpalette(palette.getpalette()[:765] + [0, 0, 0])
-        out.append(im.resize((WIDTH * SCALE, HEIGHT * SCALE), Image.Resampling.NEAREST))
+        out.append(im)
     output.parent.mkdir(parents=True, exist_ok=True)
     out[0].save(output, save_all=True, append_images=out[1:], duration=80, loop=0,
                 optimize=False, transparency=255, disposal=1)
     return frames
 
 
+def draw_flag(frame, depth, fx, fy, fz, length, color, phase):
+    """A pennant rippling from the top of its pole."""
+    c = np.array(rgb(color), np.float32)
+    X, Y = (int(round(v)) for v in project(fx + 0.5, fy + 0.5, fz))
+    d = fx + fy + fz
+    pole = np.array([120, 110, 100], np.float32)
+    for yy in range(-K, 4 * K):
+        put(frame, depth, X, Y + yy, d, pole)
+    put(frame, depth, X, Y - K - 1, d, np.array([220, 200, 120], np.float32))
+    width, tall = int(length * 2.2 * K), 2 * K + 1
+    for i in range(1, width):
+        wave = math.sin(phase * 2 - i / (2.2 * K) * 0.9)
+        lift = int(round(wave * 1.2 * K * min(1.0, i / (2 * K))))
+        k = 0.8 + 0.25 * wave
+        rows = tall - int(round(i / width * K))    # tapering to the tip
+        for j in range(rows):
+            edge = 1.15 if j == 0 else 0.85 if j == rows - 1 else 1.0
+            put(frame, depth, X + i, Y + j + lift, d + 50, np.clip(c * k * edge, 0, 255))
+
+
 SKIN = np.array([215, 175, 135], np.float32)
+HOSE = np.array([62, 52, 46], np.float32)
 BOOTS = np.array([45, 36, 30], np.float32)
 STEEL = np.array([175, 182, 196], np.float32)
+SHAFT = np.array([120, 92, 62], np.float32)
 
 
 def draw_walker(frame, depth, glow, wk, f, n, phase):
-    """A tiny walking figure: townsfolk or a spear-carrying soldier."""
+    """A small walking figure: townsfolk or a spear-carrying soldier."""
     x0, y0, x1, y1 = wk["x0"], wk["y0"], wk["x1"], wk["y1"]
     length = math.hypot(x1 - x0, y1 - y0)
     moving = wk["mode"] != "stand"
@@ -1028,57 +1113,80 @@ def draw_walker(frame, depth, glow, wk, f, n, phase):
         sx_, sy_, step = x0, y0, 0
     X, Y = (int(round(v)) for v in project(sx_ + 0.5, sy_ + 0.5, wk["z"]))
     d = sx_ + sy_ + wk["z"] + 0.6
-    coat = np.array(rgb(wk["coat"]), np.float32)
-    stride = moving and step % 2 == 1
-    # Legs scissor on alternate steps.
-    if stride:
-        lx = (X - 2, X + 1) if step == 1 else (X - 1, X + 2)
+    soldier = wk["kind"] == "soldier"
+    coat = np.array(rgb(wk["coat"]), np.float32) * (1.15 if soldier else 1.0)
+
+    def dot(dx, h, color):
+        put(frame, depth, X + dx, Y - h, d, np.clip(color, 0, 255))
+
+    def span(h, a, b, color, lit=True):
+        # Lit from the moon on the left, shaded on the right.
+        for dx in range(a, b + 1):
+            k = (dx - a) / max(1, b - a)
+            dot(dx, h, color * ((1.15 if k < 0.3 else 1.0 if k < 0.7 else 0.72) if lit else 1.0))
+
+    # Legs scissor as the figure walks.
+    swing = [0, 2, 0, -2][step] if moving else 0
+    for h in range(1, 7):
+        off = int(round(swing * (7 - h) / 6))
+        leg = BOOTS if h <= 2 else HOSE
+        for dx in (-2, -1):
+            dot(dx + off, h, leg)
+        for dx in (1, 2):
+            dot(dx - off, h, leg * 0.8)
+    # Coat, belt and shoulders.
+    for h in range(7, 15):
+        span(h, -3, 3, coat * (0.8 if h == 9 else 1.0))
+    span(15, -2, 2, coat)
+    if soldier:
+        dot(0, 9, np.array([200, 190, 120], np.float32))  # belt buckle
+    # Arms swing opposite the legs; a soldier's right hand grips the spear.
+    arm = -swing // 2 if moving else 0
+    for h in range(9, 15):
+        dot(-4 + int(round(arm * (15 - h) / 6)), h, coat * 0.9)
+    dot(-4 + arm, 8, SKIN * 0.9)
+    if soldier:
+        for h, dx in ((14, 4), (13, 4), (12, 5)):
+            dot(dx, h, coat * 0.6)
+        dot(5, 11, SKIN * 0.8)
     else:
-        lx = (X - 1, X + 1)
-    put(frame, depth, lx[0], Y - 1, d, BOOTS)
-    put(frame, depth, lx[1], Y - 1, d, BOOTS * 0.8)
-    put(frame, depth, X - 1, Y - 2, d, BOOTS)
-    put(frame, depth, X + 1, Y - 2, d, BOOTS * 0.8)
-    if wk["kind"] == "soldier":
-        coat = coat * 1.15
-    # Body: lit from the moon on the left, shaded on the right.
-    for yy in (3, 4, 5):
-        put(frame, depth, X - 1, Y - yy, d, np.clip(coat * 1.15, 0, 255))
-        put(frame, depth, X, Y - yy, d, coat)
-        put(frame, depth, X + 1, Y - yy, d, coat * 0.7)
-    if wk["kind"] == "soldier":
-        put(frame, depth, X, Y - 4, d, np.array([200, 190, 120], np.float32))  # belt buckle
-    # Swinging arms.
-    if moving:
-        put(frame, depth, X - 2, Y - 4 + (step < 2), d, coat * 0.9)
-        put(frame, depth, X + 2, Y - 4 + (step >= 2), d, coat * 0.6)
-    put(frame, depth, X - 1, Y - 6, d, SKIN)
-    put(frame, depth, X, Y - 6, d, SKIN * 0.92)
-    put(frame, depth, X + 1, Y - 6, d, SKIN * 0.75)
-    if wk["kind"] == "soldier":
-        for xx, k in ((X - 1, 1.1), (X, 1.0), (X + 1, 0.75)):
-            put(frame, depth, xx, Y - 7, d, np.clip(STEEL * k, 0, 255))
-        put(frame, depth, X, Y - 8, d, np.array([200, 50, 45], np.float32))  # plume
+        for h in range(9, 15):
+            dot(4 - int(round(arm * (15 - h) / 6)), h, coat * 0.6)
+        dot(4 - arm, 8, SKIN * 0.7)
+    # Head.
+    for h, (a, b) in zip(range(16, 22), [(-1, 1), (-2, 2), (-2, 2), (-2, 2), (-2, 2), (-1, 1)]):
+        span(h, a, b, SKIN)
+    if soldier:
+        for h, (a, b) in zip(range(20, 24), [(-3, 3), (-2, 2), (-2, 2), (-1, 1)]):
+            span(h, a, b, STEEL)
+        plume = np.array([200, 50, 45], np.float32)
+        for dx, h in ((0, 24), (1, 24), (1, 25), (2, 25), (2, 26), (3, 26)):
+            dot(dx, h, plume)
         # Spear held upright, with a glinting tip.
-        for yy in range(2, 11):
-            put(frame, depth, X + 3, Y - yy, d, np.array([120, 92, 62], np.float32))
+        for h in range(3, 34):
+            dot(6, h, SHAFT)
         glint = 1.0 + 0.4 * max(0.0, math.sin(phase * 2 + d * 0.3))
-        put(frame, depth, X + 3, Y - 11, d, np.clip(STEEL * glint, 0, 255))
-        put(frame, depth, X + 3, Y - 12, d, np.clip(STEEL * glint, 0, 255))
+        for h, (a, b) in zip(range(34, 39), [(5, 7), (5, 7), (6, 6), (6, 6), (6, 6)]):
+            span(h, a, b, STEEL * glint, lit=False)
     else:
         hair = np.array(rgb(wk.get("hair", "#2a1d14")), np.float32)
-        for xx in (X - 1, X, X + 1):
-            put(frame, depth, xx, Y - 7, d, hair)
+        for h, (a, b) in zip(range(20, 23), [(-2, 2), (-2, 2), (-1, 1)]):
+            span(h, a, b, hair)
+        dot(2, 19, hair * 0.8)
+        dot(2, 18, hair * 0.8)
     if wk["torch"]:
         fl = 0.8 + 0.2 * math.sin(phase * 7 + wk["phase"] * 9 + d)
-        tcol = np.array([255, 190, 80], np.float32) * fl
-        tx = X - 3 if wk["kind"] == "soldier" else X + 3
-        put(frame, depth, tx, Y - 5, d, np.array([90, 60, 40], np.float32))
-        put(frame, depth, tx, Y - 6, d, np.array([90, 60, 40], np.float32))
-        put(frame, depth, tx, Y - 7, d, tcol)
-        put(frame, depth, tx, Y - 8, d, np.array([255, 235, 160], np.float32) * fl)
-        if 0 <= tx < WIDTH and 0 <= Y - 8 < HEIGHT:
-            glow[Y - 8:Y - 6, tx] = tcol * 1.8
+        flame = np.array([255, 190, 80], np.float32) * fl
+        core = np.array([255, 235, 160], np.float32) * fl
+        tx = -6 if soldier else 6
+        for h in range(11, 18):
+            dot(tx, h, np.array([90, 60, 40], np.float32))
+        for h, (a, b), col in ((18, (-1, 1), flame), (19, (-1, 1), core), (20, (-1, 1), flame),
+                               (21, (0, 0), flame), (22, (0, 0), flame * 0.8)):
+            for dx in range(a, b + 1):
+                dot(tx + dx, h, col)
+        if 1 <= X + tx < WIDTH - 1 and 22 <= Y < HEIGHT:
+            glow[Y - 22:Y - 17, X + tx - 1:X + tx + 2] = flame * 1.8
 
 
 def put(frame, depth, x, y, d, color):
